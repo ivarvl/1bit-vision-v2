@@ -91,6 +91,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="path to ImageNet-1K pretrained BinaryAttention backbone (.pth)",
     )
+    p.add_argument(
+        "--no-fpn",
+        action="store_true",
+        help="disable the ViTDet simple feature pyramid (use single-scale stride-16 features)",
+    )
+    p.add_argument(
+        "--fpn-channels", type=int, default=256, help="FPN output channels per level"
+    )
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--resume", type=str, default=None)
@@ -148,6 +156,8 @@ def main() -> None:
         attn_quant=not args.no_attn_quant,
         pv_quant=not args.no_pv_quant,
         drop_path_rate=args.drop_path,
+        use_fpn=not args.no_fpn,
+        fpn_out_channels=args.fpn_channels,
     ).to(device)
 
     if args.pretrained:

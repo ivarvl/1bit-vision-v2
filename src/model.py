@@ -12,6 +12,7 @@ positional-embedding interpolation needed for training.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from functools import partial
 
 import torch
@@ -25,9 +26,9 @@ from torchvision.ops import MultiScaleRoIAlign
 from binaryattn import Block, resize_pos_embed
 
 VARIANTS = {
-    "tiny":  dict(embed_dim=192, depth=12, num_heads=3),
+    "tiny": dict(embed_dim=192, depth=12, num_heads=3),
     "small": dict(embed_dim=384, depth=12, num_heads=6),
-    "base":  dict(embed_dim=768, depth=12, num_heads=12),
+    "base": dict(embed_dim=768, depth=12, num_heads=12),
 }
 
 
@@ -119,17 +120,86 @@ class BinaryViTBackbone(nn.Module):
         return x
 
 
+class SimpleFeaturePyramid(nn.Module):
+    """ViTDet-style simple feature pyramid (Li et al., 2022).
+
+    Builds a 4-level pyramid (strides 4, 8, 16, 32) from a single stride-16 ViT
+    feature map by per-level rescaling (transposed convs / pool) followed by a
+    1x1 + 3x3 conv tail.  GroupNorm chosen to be small-batch friendly.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int = 256):
+        super().__init__()
+        self.out_channels = out_channels
+
+        def gn(c: int) -> nn.Module:
+            return nn.GroupNorm(32, c)
+
+        self.scale_ops = nn.ModuleList(
+            [
+                # stride 4: 4x upsample
+                nn.Sequential(
+                    nn.ConvTranspose2d(in_channels, in_channels, 2, 2),
+                    gn(in_channels),
+                    nn.GELU(),
+                    nn.ConvTranspose2d(in_channels, in_channels, 2, 2),
+                ),
+                # stride 8: 2x upsample
+                nn.ConvTranspose2d(in_channels, in_channels, 2, 2),
+                # stride 16: identity
+                nn.Identity(),
+                # stride 32: 2x downsample
+                nn.MaxPool2d(2, 2),
+            ]
+        )
+        self.tails = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                    gn(out_channels),
+                    nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+                    gn(out_channels),
+                )
+                for _ in range(4)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
+        out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        for i, (op, tail) in enumerate(zip(self.scale_ops, self.tails)):
+            out[str(i)] = tail(op(x))
+        return out
+
+
+class BinaryViTBackboneWithFPN(nn.Module):
+    """``BinaryViTBackbone`` + ``SimpleFeaturePyramid`` for FasterRCNN with FPN."""
+
+    def __init__(self, body: BinaryViTBackbone, fpn_out_channels: int = 256):
+        super().__init__()
+        self.body = body
+        self.fpn = SimpleFeaturePyramid(body.out_channels, fpn_out_channels)
+        self.out_channels = fpn_out_channels
+
+    def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
+        return self.fpn(self.body(x))
+
+
 def load_pretrained_backbone(
-    backbone: BinaryViTBackbone, ckpt_path: str
+    backbone: nn.Module, ckpt_path: str
 ) -> tuple[list[str], list[str]]:
     """Load an ImageNet-1K pretrained BinaryAttention checkpoint into the backbone.
 
     Drops the classifier head and the (input-size-tied) relative position bias,
     then bicubically interpolates ``pos_embed`` from the pretraining grid
-    (14x14 @ 224) to the detection grid (e.g. 32x32 @ 512).
+    (14x14 @ 224) to the detection grid (e.g. 32x32 @ 512).  Accepts either a
+    bare ``BinaryViTBackbone`` or a ``BinaryViTBackboneWithFPN`` wrapper — only
+    the ViT body is touched; the FPN is left at its random init.
 
     Returns ``(missing_keys, unexpected_keys)`` from ``load_state_dict``.
     """
+    if hasattr(backbone, "body") and isinstance(backbone.body, BinaryViTBackbone):
+        backbone = backbone.body
+
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt.get("model", ckpt.get("state_dict", ckpt))
 
@@ -142,15 +212,18 @@ def load_pretrained_backbone(
 
     drop_prefixes = ("head.", "head_dist.", "dist_token")
     sd = {
-        k: v for k, v in sd.items()
+        k: v
+        for k, v in sd.items()
         if not any(k.startswith(p) for p in drop_prefixes)
         and "relative_position" not in k
     }
 
     if "pos_embed" in sd and sd["pos_embed"].shape != backbone.pos_embed.shape:
         sd["pos_embed"] = resize_pos_embed(
-            sd["pos_embed"], backbone.pos_embed,
-            num_tokens=1, gs_new=backbone.grid_size,
+            sd["pos_embed"],
+            backbone.pos_embed,
+            num_tokens=1,
+            gs_new=backbone.grid_size,
         )
 
     missing, unexpected = backbone.load_state_dict(sd, strict=False)
@@ -164,14 +237,21 @@ def build_faster_rcnn(
     attn_quant: bool = True,
     pv_quant: bool = True,
     drop_path_rate: float = 0.1,
+    use_fpn: bool = True,
+    fpn_out_channels: int = 256,
 ) -> FasterRCNN:
-    """Faster R-CNN with a BinaryAttention-T/S/B backbone (single-scale FPN)."""
+    """Faster R-CNN with a BinaryAttention-T/S/B backbone.
+
+    ``use_fpn=True`` (default) wraps the ViT in a ViTDet-style simple feature
+    pyramid producing 4 levels at strides 4/8/16/32. ``use_fpn=False`` falls
+    back to a single-scale stride-16 feature with multi-size anchors.
+    """
     if variant not in VARIANTS:
         raise ValueError(f"variant must be one of {list(VARIANTS)}")
     if img_size % 16 != 0:
         raise ValueError("img_size must be divisible by patch_size (16)")
 
-    backbone = BinaryViTBackbone(
+    body = BinaryViTBackbone(
         img_size=img_size,
         attn_quant=attn_quant,
         pv_quant=pv_quant,
@@ -179,11 +259,25 @@ def build_faster_rcnn(
         **VARIANTS[variant],
     )
 
-    anchor_generator = AnchorGenerator(
-        sizes=((32, 64, 128, 256, 512),),
-        aspect_ratios=((0.5, 1.0, 2.0),),
-    )
-    roi_pool = MultiScaleRoIAlign(featmap_names=["0"], output_size=7, sampling_ratio=2)
+    if use_fpn:
+        backbone = BinaryViTBackboneWithFPN(body, fpn_out_channels=fpn_out_channels)
+        # one anchor scale per pyramid level (strides 4, 8, 16, 32)
+        anchor_generator = AnchorGenerator(
+            sizes=((32,), (64,), (128,), (256,)),
+            aspect_ratios=((0.5, 1.0, 2.0),) * 4,
+        )
+        roi_pool = MultiScaleRoIAlign(
+            featmap_names=["0", "1", "2", "3"], output_size=7, sampling_ratio=2
+        )
+    else:
+        backbone = body
+        anchor_generator = AnchorGenerator(
+            sizes=((32, 64, 128, 256, 512),),
+            aspect_ratios=((0.5, 1.0, 2.0),),
+        )
+        roi_pool = MultiScaleRoIAlign(
+            featmap_names=["0"], output_size=7, sampling_ratio=2
+        )
 
     return FasterRCNN(
         backbone,
