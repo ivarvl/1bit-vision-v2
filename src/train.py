@@ -12,9 +12,13 @@ import json
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+
+# Avoid "too many open files" with multi-worker DataLoader at large batch sizes.
+mp.set_sharing_strategy("file_system")
 
 from dataset import VOC2012Detection
 from engine import evaluate, log_compute_stats, train_one_epoch
@@ -61,26 +65,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--variant", choices=["tiny", "small", "base"], default="tiny")
     p.add_argument("--img-size", type=int, default=512)
     p.add_argument("--epochs", type=int, default=24)
-    p.add_argument("--batch-size", type=int, default=8,
-                   help="paper uses 64 (multi-GPU); default 8 for a single GPU")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="paper uses 64 (multi-GPU); default 8 for a single GPU",
+    )
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--warmup-iters", type=int, default=250)
+    p.add_argument("--warmup-iters", type=int, default=50)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--drop-path", type=float, default=0.1)
-    p.add_argument("--no-attn-quant", action="store_true",
-                   help="disable binary QK quantization (debug / fp baseline)")
-    p.add_argument("--no-pv-quant", action="store_true",
-                   help="disable 8-bit P/V quantization")
-    p.add_argument("--pretrained", type=str, default=None,
-                   help="path to ImageNet-1K pretrained BinaryAttention backbone (.pth)")
+    p.add_argument(
+        "--no-attn-quant",
+        action="store_true",
+        help="disable binary QK quantization (debug / fp baseline)",
+    )
+    p.add_argument(
+        "--no-pv-quant", action="store_true", help="disable 8-bit P/V quantization"
+    )
+    p.add_argument(
+        "--pretrained",
+        type=str,
+        default=None,
+        help="path to ImageNet-1K pretrained BinaryAttention backbone (.pth)",
+    )
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--debug-subset", type=int, default=0,
-                   help="if >0, use only this many train+val images (smoke test)")
+    p.add_argument(
+        "--debug-subset",
+        type=int,
+        default=0,
+        help="if >0, use only this many train+val images (smoke test)",
+    )
     return p.parse_args()
 
 
@@ -95,21 +115,30 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_ds = VOC2012Detection(args.data_root, split="train", transforms=HFlip(0.5))
-    val_ds   = VOC2012Detection(args.data_root, split="val", transforms=None)
+    val_ds = VOC2012Detection(args.data_root, split="val", transforms=None)
 
     if args.debug_subset > 0:
         train_ds.ids = train_ds.ids[: args.debug_subset]
-        val_ds.ids   = val_ds.ids[: args.debug_subset]
+        val_ds.ids = val_ds.ids[: args.debug_subset]
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=collate_fn,
-        pin_memory=True, drop_last=True, persistent_workers=args.num_workers > 0,
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn,
-        pin_memory=True, persistent_workers=args.num_workers > 0,
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     model = build_faster_rcnn(
@@ -124,12 +153,18 @@ def main() -> None:
     if args.pretrained:
         missing, unexpected = load_pretrained_backbone(model.backbone, args.pretrained)
         print(f"loaded pretrained backbone from {args.pretrained}")
-        print(f"  missing ({len(missing)}): {missing[:6]}{' ...' if len(missing) > 6 else ''}")
-        print(f"  unexpected ({len(unexpected)}): {unexpected[:6]}{' ...' if len(unexpected) > 6 else ''}")
+        print(
+            f"  missing ({len(missing)}): {missing[:6]}{' ...' if len(missing) > 6 else ''}"
+        )
+        print(
+            f"  unexpected ({len(unexpected)}): {unexpected[:6]}{' ...' if len(unexpected) > 6 else ''}"
+        )
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay,
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
     )
 
     total_steps = max(1, len(train_loader) * args.epochs)
@@ -150,14 +185,23 @@ def main() -> None:
         print(f"resumed from {args.resume} @ epoch {start_epoch}")
 
     log_compute_stats(model, model.backbone, args.img_size, device, writer)
-    print(f"model={args.variant} train={len(train_ds)} val={len(val_ds)} "
-          f"steps/epoch={len(train_loader)}")
+    print(
+        f"model={args.variant} train={len(train_ds)} val={len(val_ds)} "
+        f"steps/epoch={len(train_loader)}"
+    )
 
     for epoch in range(start_epoch, args.epochs):
         global_step = train_one_epoch(
-            model, optimizer, scheduler, train_loader, device,
-            epoch, writer, global_step,
-            log_interval=args.log_interval, grad_clip=args.grad_clip,
+            model,
+            optimizer,
+            scheduler,
+            train_loader,
+            device,
+            epoch,
+            writer,
+            global_step,
+            log_interval=args.log_interval,
+            grad_clip=args.grad_clip,
         )
 
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
