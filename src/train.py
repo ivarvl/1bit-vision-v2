@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import VOC2012Detection
-from engine import evaluate, train_one_epoch
-from model import build_faster_rcnn
+from engine import evaluate, log_compute_stats, train_one_epoch
+from model import build_faster_rcnn, load_pretrained_backbone
 
 
 class HFlip:
@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
                    help="disable binary QK quantization (debug / fp baseline)")
     p.add_argument("--no-pv-quant", action="store_true",
                    help="disable 8-bit P/V quantization")
+    p.add_argument("--pretrained", type=str, default=None,
+                   help="path to ImageNet-1K pretrained BinaryAttention backbone (.pth)")
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--resume", type=str, default=None)
@@ -119,6 +121,12 @@ def main() -> None:
         drop_path_rate=args.drop_path,
     ).to(device)
 
+    if args.pretrained:
+        missing, unexpected = load_pretrained_backbone(model.backbone, args.pretrained)
+        print(f"loaded pretrained backbone from {args.pretrained}")
+        print(f"  missing ({len(missing)}): {missing[:6]}{' ...' if len(missing) > 6 else ''}")
+        print(f"  unexpected ({len(unexpected)}): {unexpected[:6]}{' ...' if len(unexpected) > 6 else ''}")
+
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay,
@@ -141,9 +149,9 @@ def main() -> None:
         best_ap = ck.get("best_ap", -1.0)
         print(f"resumed from {args.resume} @ epoch {start_epoch}")
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"model={args.variant} params={n_params/1e6:.2f}M "
-          f"train={len(train_ds)} val={len(val_ds)} steps/epoch={len(train_loader)}")
+    log_compute_stats(model, model.backbone, args.img_size, device, writer)
+    print(f"model={args.variant} train={len(train_ds)} val={len(val_ds)} "
+          f"steps/epoch={len(train_loader)}")
 
     for epoch in range(start_epoch, args.epochs):
         global_step = train_one_epoch(

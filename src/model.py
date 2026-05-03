@@ -22,7 +22,7 @@ from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import MultiScaleRoIAlign
 
-from binaryattn import Block
+from binaryattn import Block, resize_pos_embed
 
 VARIANTS = {
     "tiny":  dict(embed_dim=192, depth=12, num_heads=3),
@@ -117,6 +117,44 @@ class BinaryViTBackbone(nn.Module):
         x = self.norm(x)
         x = x[:, 1:].transpose(1, 2).reshape(B, -1, h, w)
         return x
+
+
+def load_pretrained_backbone(
+    backbone: BinaryViTBackbone, ckpt_path: str
+) -> tuple[list[str], list[str]]:
+    """Load an ImageNet-1K pretrained BinaryAttention checkpoint into the backbone.
+
+    Drops the classifier head and the (input-size-tied) relative position bias,
+    then bicubically interpolates ``pos_embed`` from the pretraining grid
+    (14x14 @ 224) to the detection grid (e.g. 32x32 @ 512).
+
+    Returns ``(missing_keys, unexpected_keys)`` from ``load_state_dict``.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt.get("model", ckpt.get("state_dict", ckpt))
+
+    pe_w = sd.get("patch_embed.proj.weight")
+    if pe_w is not None and pe_w.shape[0] != backbone.out_channels:
+        raise ValueError(
+            f"checkpoint embed_dim={pe_w.shape[0]} != backbone embed_dim="
+            f"{backbone.out_channels} (variant mismatch?)"
+        )
+
+    drop_prefixes = ("head.", "head_dist.", "dist_token")
+    sd = {
+        k: v for k, v in sd.items()
+        if not any(k.startswith(p) for p in drop_prefixes)
+        and "relative_position" not in k
+    }
+
+    if "pos_embed" in sd and sd["pos_embed"].shape != backbone.pos_embed.shape:
+        sd["pos_embed"] = resize_pos_embed(
+            sd["pos_embed"], backbone.pos_embed,
+            num_tokens=1, gs_new=backbone.grid_size,
+        )
+
+    missing, unexpected = backbone.load_state_dict(sd, strict=False)
+    return list(missing), list(unexpected)
 
 
 def build_faster_rcnn(

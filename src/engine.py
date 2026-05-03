@@ -1,8 +1,8 @@
 """Train one epoch and evaluate (COCO mAP) for the BinaryAttention detector.
 
 All scalars are streamed to a ``torch.utils.tensorboard.SummaryWriter`` provided
-by the caller — per-iteration training losses + LR + grad-norm, and per-epoch
-COCO metrics.
+by the caller — per-iteration training losses + LR + grad-norm, peak GPU memory
+per epoch, and per-epoch COCO metrics.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Iterable
 
 import torch
 from pycocotools.cocoeval import COCOeval
+from torch.utils.flop_counter import FlopCounterMode
 from torch.utils.tensorboard import SummaryWriter
 
 # COCOeval.stats indices.
@@ -34,6 +35,48 @@ COCO_METRICS = [
 ]
 
 
+def log_compute_stats(
+    model: torch.nn.Module,
+    backbone: torch.nn.Module,
+    img_size: int,
+    device: torch.device,
+    writer: SummaryWriter,
+) -> dict[str, float]:
+    """One-shot static stats: total/trainable params, model size (MB), backbone GFLOPs.
+
+    FLOPs are counted on the backbone alone with a single ``[1, 3, img, img]``
+    input — matching how ViT detection papers report backbone compute.  The
+    counter treats the binary QK matmul as full-precision; the paper reports
+    BOPs (binary ops) separately.
+    """
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2)
+
+    was_training = backbone.training
+    backbone.eval()
+    x = torch.zeros(1, 3, img_size, img_size, device=device)
+    with torch.no_grad(), FlopCounterMode(display=False) as fcm:
+        backbone(x)
+    backbone.train(was_training)
+    gflops = fcm.get_total_flops() / 1e9
+
+    writer.add_scalar("compute/params_M", n_params / 1e6, 0)
+    writer.add_scalar("compute/trainable_params_M", n_trainable / 1e6, 0)
+    writer.add_scalar("compute/model_size_MB", size_mb, 0)
+    writer.add_scalar("compute/backbone_GFLOPs", gflops, 0)
+    print(
+        f"compute: params={n_params/1e6:.2f}M trainable={n_trainable/1e6:.2f}M "
+        f"size={size_mb:.1f}MB backbone={gflops:.2f}GFLOPs @ {img_size}x{img_size}"
+    )
+    return {
+        "params_M": n_params / 1e6,
+        "trainable_params_M": n_trainable / 1e6,
+        "model_size_MB": size_mb,
+        "backbone_GFLOPs": gflops,
+    }
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -50,6 +93,8 @@ def train_one_epoch(
     model.train()
     n_batches = len(loader)
     t0 = time.time()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     for it, (images, targets) in enumerate(loader):
         images = [img.to(device, non_blocking=True) for img in images]
@@ -82,6 +127,12 @@ def train_one_epoch(
         global_step += 1
 
     writer.add_scalar("train/epoch_time_s", time.time() - t0, epoch)
+    if device.type == "cuda":
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        reserved_mb = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        writer.add_scalar("compute/train_peak_alloc_MB", peak_mb, epoch)
+        writer.add_scalar("compute/train_peak_reserved_MB", reserved_mb, epoch)
+        print(f"epoch {epoch} peak GPU mem: alloc={peak_mb:.0f}MB reserved={reserved_mb:.0f}MB")
     return global_step
 
 
@@ -97,6 +148,8 @@ def evaluate(
     model.eval()
     coco_gt = loader.dataset.coco
     results: list[dict] = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     t0 = time.time()
     for images, targets in loader:
@@ -138,6 +191,9 @@ def evaluate(
     for name, value in metrics.items():
         writer.add_scalar(f"val/{name}", value, epoch)
     writer.add_scalar("val/eval_time_s", eval_time, epoch)
+    if device.type == "cuda":
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        writer.add_scalar("compute/val_peak_alloc_MB", peak_mb, epoch)
     print(
         f"epoch {epoch} val: AP={metrics['AP']:.4f} AP50={metrics['AP50']:.4f} "
         f"AP75={metrics['AP75']:.4f} ({eval_time:.1f}s)"
