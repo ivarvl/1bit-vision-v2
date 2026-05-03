@@ -1,0 +1,14 @@
+[project]
+name = "1bit-vision"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.4.4",
+    "pycocotools>=2.0.10",
+    "tensorboard>=2.20.0",
+    "timm>=1.0.26",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+]

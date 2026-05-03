@@ -1,0 +1,160 @@
+"""BinaryAttention ViT backbone wrapped in torchvision Faster R-CNN.
+
+The backbone reuses the ``Block`` module from ``binaryattn.py`` (binary QK-attention
+with optional 8-bit P/V quantization) and exposes a single-scale ``H/16 x W/16``
+feature map suitable for ``torchvision.models.detection.FasterRCNN``.
+
+Input images are forced to a fixed square size by ``GeneralizedRCNNTransform``
+(``fixed_size``), which keeps the patch-embed grid constant — no per-batch
+positional-embedding interpolation needed for training.
+"""
+
+from __future__ import annotations
+
+import math
+from functools import partial
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.layers import PatchEmbed, trunc_normal_
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops import MultiScaleRoIAlign
+
+from binaryattn import Block
+
+VARIANTS = {
+    "tiny":  dict(embed_dim=192, depth=12, num_heads=3),
+    "small": dict(embed_dim=384, depth=12, num_heads=6),
+    "base":  dict(embed_dim=768, depth=12, num_heads=12),
+}
+
+
+class BinaryViTBackbone(nn.Module):
+    """ViT feature extractor with binary QK-attention.
+
+    Returns a ``[B, embed_dim, H/patch, W/patch]`` feature map.  ``out_channels``
+    is set so the module plugs directly into ``FasterRCNN``.
+    """
+
+    def __init__(
+        self,
+        img_size: int = 512,
+        patch_size: int = 16,
+        embed_dim: int = 192,
+        depth: int = 12,
+        num_heads: int = 3,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop_path_rate: float = 0.1,
+        attn_quant: bool = True,
+        pv_quant: bool = True,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=3, embed_dim=embed_dim
+        )
+        self.grid_size = self.patch_embed.grid_size  # (gh, gw)
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.Sequential(
+            *[
+                Block(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer,
+                    attn_quant=attn_quant,
+                    pv_quant=pv_quant,
+                    attn_bias=False,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = norm_layer(embed_dim)
+        self.out_channels = embed_dim
+
+        trunc_normal_(self.pos_embed, std=0.02)
+        trunc_normal_(self.cls_token, std=0.02)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.zeros_(m.bias)
+            nn.init.ones_(m.weight)
+
+    def _resized_pos_embed(self, h: int, w: int) -> torch.Tensor:
+        gh, gw = self.grid_size
+        if (h, w) == (gh, gw):
+            return self.pos_embed
+        cls_pe, patch_pe = self.pos_embed[:, :1], self.pos_embed[:, 1:]
+        pe = patch_pe.reshape(1, gh, gw, -1).permute(0, 3, 1, 2)
+        pe = F.interpolate(pe, size=(h, w), mode="bicubic", align_corners=False)
+        pe = pe.permute(0, 2, 3, 1).reshape(1, h * w, -1)
+        return torch.cat([cls_pe, pe], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        h, w = H // self.patch_size, W // self.patch_size
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1) + self._resized_pos_embed(h, w)
+        x = self.blocks(x)
+        x = self.norm(x)
+        x = x[:, 1:].transpose(1, 2).reshape(B, -1, h, w)
+        return x
+
+
+def build_faster_rcnn(
+    variant: str = "tiny",
+    num_classes: int = 21,
+    img_size: int = 512,
+    attn_quant: bool = True,
+    pv_quant: bool = True,
+    drop_path_rate: float = 0.1,
+) -> FasterRCNN:
+    """Faster R-CNN with a BinaryAttention-T/S/B backbone (single-scale FPN)."""
+    if variant not in VARIANTS:
+        raise ValueError(f"variant must be one of {list(VARIANTS)}")
+    if img_size % 16 != 0:
+        raise ValueError("img_size must be divisible by patch_size (16)")
+
+    backbone = BinaryViTBackbone(
+        img_size=img_size,
+        attn_quant=attn_quant,
+        pv_quant=pv_quant,
+        drop_path_rate=drop_path_rate,
+        **VARIANTS[variant],
+    )
+
+    anchor_generator = AnchorGenerator(
+        sizes=((32, 64, 128, 256, 512),),
+        aspect_ratios=((0.5, 1.0, 2.0),),
+    )
+    roi_pool = MultiScaleRoIAlign(featmap_names=["0"], output_size=7, sampling_ratio=2)
+
+    return FasterRCNN(
+        backbone,
+        num_classes=num_classes,
+        rpn_anchor_generator=anchor_generator,
+        box_roi_pool=roi_pool,
+        min_size=img_size,
+        max_size=img_size,
+        fixed_size=(img_size, img_size),
+        image_mean=[0.485, 0.456, 0.406],
+        image_std=[0.229, 0.224, 0.225],
+    )
