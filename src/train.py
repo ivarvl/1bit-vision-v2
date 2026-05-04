@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--warmup-iters", type=int, default=50)
+    p.add_argument("--warmup-iters", type=int, default=250)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--drop-path", type=float, default=0.1)
     p.add_argument(

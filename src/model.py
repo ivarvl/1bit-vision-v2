@@ -157,8 +157,10 @@ class SimpleFeaturePyramid(nn.Module):
                 nn.Sequential(
                     nn.Conv2d(in_channels, out_channels, 1, bias=False),
                     gn(out_channels),
+                    nn.GELU(),
                     nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
                     gn(out_channels),
+                    nn.GELU(),
                 )
                 for _ in range(4)
             ]
