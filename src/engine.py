@@ -14,9 +14,13 @@ import time
 from typing import Iterable
 
 import torch
+import torchvision.transforms.functional as TF
 from pycocotools.cocoeval import COCOeval
 from torch.utils.flop_counter import FlopCounterMode
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import draw_bounding_boxes, make_grid
+
+from dataset import VOC_CLASSES
 
 # COCOeval.stats indices.
 COCO_METRICS = [
@@ -136,6 +140,49 @@ def train_one_epoch(
     return global_step
 
 
+_VIS_SCORE_THRESH = 0.3
+_VIS_SIZE = 512
+
+
+def _vis_detections(
+    vis_data: list[tuple],
+    epoch: int,
+    writer: SummaryWriter,
+) -> None:
+    """Draw GT (green) and predicted (red) boxes on images and log a grid to TensorBoard."""
+    imgs = []
+    for img_cpu, pred_boxes, pred_scores, pred_labels, gt_boxes in vis_data:
+        img_u8 = (img_cpu.clamp(0, 1) * 255).to(torch.uint8)
+        _, orig_h, orig_w = img_u8.shape
+        img_u8 = TF.resize(img_u8, [_VIS_SIZE, _VIS_SIZE])
+
+        sx, sy = _VIS_SIZE / orig_w, _VIS_SIZE / orig_h
+
+        def _scale(b: torch.Tensor) -> torch.Tensor:
+            b = b.clone().float()
+            b[:, [0, 2]] *= sx
+            b[:, [1, 3]] *= sy
+            return b
+
+        if gt_boxes.numel():
+            img_u8 = draw_bounding_boxes(img_u8, _scale(gt_boxes), colors="green", width=2)
+
+        keep = pred_scores >= _VIS_SCORE_THRESH
+        if keep.any():
+            label_strs = [
+                f"{VOC_CLASSES[l - 1] if 1 <= l <= len(VOC_CLASSES) else '?'} {s:.2f}"
+                for l, s in zip(pred_labels[keep].tolist(), pred_scores[keep].tolist())
+            ]
+            img_u8 = draw_bounding_boxes(
+                img_u8, _scale(pred_boxes[keep]), labels=label_strs, colors="red", width=2
+            )
+
+        imgs.append(img_u8)
+
+    grid = make_grid(torch.stack(imgs), nrow=4)
+    writer.add_image("val/detections", grid, epoch)
+
+
 @torch.inference_mode()
 def evaluate(
     model: torch.nn.Module,
@@ -143,19 +190,29 @@ def evaluate(
     device: torch.device,
     epoch: int,
     writer: SummaryWriter,
+    num_vis_images: int = 8,
 ) -> dict[str, float]:
     """Run COCO-style evaluation and log the standard 12 metrics."""
     model.eval()
     coco_gt = loader.dataset.coco
     results: list[dict] = []
+    vis_data: list[tuple] = []
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     t0 = time.time()
     for images, targets in loader:
-        images = [img.to(device, non_blocking=True) for img in images]
-        outputs = model(images)
-        for tgt, out in zip(targets, outputs):
+        images_dev = [img.to(device, non_blocking=True) for img in images]
+        outputs = model(images_dev)
+        for img_cpu, tgt, out in zip(images, targets, outputs):
+            if len(vis_data) < num_vis_images:
+                vis_data.append((
+                    img_cpu,
+                    out["boxes"].cpu(),
+                    out["scores"].cpu(),
+                    out["labels"].cpu(),
+                    tgt["boxes"],
+                ))
             img_id = int(tgt["image_id"].item())
             boxes = out["boxes"].cpu()
             scores = out["scores"].cpu()
@@ -173,6 +230,9 @@ def evaluate(
                     }
                 )
     eval_time = time.time() - t0
+
+    if vis_data:
+        _vis_detections(vis_data, epoch, writer)
 
     if not results:
         print("eval: no detections produced; skipping COCO eval")
