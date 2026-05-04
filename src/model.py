@@ -241,6 +241,7 @@ def build_faster_rcnn(
     drop_path_rate: float = 0.1,
     use_fpn: bool = True,
     fpn_out_channels: int = 256,
+    anchor_scale: float = 1.0,
 ) -> FasterRCNN:
     """Faster R-CNN with a BinaryAttention-T/S/B backbone.
 
@@ -261,10 +262,13 @@ def build_faster_rcnn(
         **VARIANTS[variant],
     )
 
+    def _scale(sizes: tuple[int, ...]) -> tuple[int, ...]:
+        return tuple(max(1, round(s * anchor_scale)) for s in sizes)
+
     if use_fpn:
         backbone = BinaryViTBackboneWithFPN(body, fpn_out_channels=fpn_out_channels)
         anchor_generator = AnchorGenerator(
-            sizes=((32,), (64,), (128,), (256,)),
+            sizes=tuple((s,) for s in _scale((32, 64, 128, 256))),
             aspect_ratios=((0.5, 1.0, 2.0),) * 4,
         )
         roi_pool = MultiScaleRoIAlign(
@@ -273,7 +277,7 @@ def build_faster_rcnn(
     else:
         backbone = body
         anchor_generator = AnchorGenerator(
-            sizes=((32, 64, 128, 256, 512),),
+            sizes=(_scale((32, 64, 128, 256, 512)),),
             aspect_ratios=((0.5, 1.0, 2.0),),
         )
         roi_pool = MultiScaleRoIAlign(

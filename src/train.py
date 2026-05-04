@@ -99,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--fpn-channels", type=int, default=256, help="FPN output channels per level"
     )
+    p.add_argument(
+        "--anchor-scale",
+        type=float,
+        default=1.0,
+        help="multiply RPN anchor sizes by this factor (e.g. 2.0 for img-size 1024)",
+    )
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--log-interval", type=int, default=20)
     p.add_argument("--resume", type=str, default=None)
@@ -158,6 +164,7 @@ def main() -> None:
         drop_path_rate=args.drop_path,
         use_fpn=not args.no_fpn,
         fpn_out_channels=args.fpn_channels,
+        anchor_scale=args.anchor_scale,
     ).to(device)
 
     if args.pretrained:
