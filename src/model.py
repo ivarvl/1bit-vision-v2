@@ -262,11 +262,11 @@ def build_faster_rcnn(
     if use_fpn:
         backbone = BinaryViTBackboneWithFPN(body, fpn_out_channels=fpn_out_channels)
         anchor_generator = AnchorGenerator(
-            sizes=((16,), (32,), (64,), (128,)),
+            sizes=((32,), (64,), (128,), (256,)),
             aspect_ratios=((0.5, 1.0, 2.0),) * 4,
         )
         roi_pool = MultiScaleRoIAlign(
-            featmap_names=["0", "1", "2", "3", "4"], output_size=7, sampling_ratio=2
+            featmap_names=["0", "1", "2", "3"], output_size=7, sampling_ratio=2
         )
     else:
         backbone = body
