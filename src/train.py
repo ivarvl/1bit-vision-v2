@@ -170,11 +170,21 @@ def main() -> None:
             f"  unexpected ({len(unexpected)}): {unexpected[:6]}{' ...' if len(unexpected) > 6 else ''}"
         )
 
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or "pos_embed" in name or "cls_token" in name:
+            no_decay.append(param)
+        else:
+            decay.append(param)
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        [
+            {"params": decay, "weight_decay": args.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
         lr=args.lr,
         betas=(0.9, 0.999),
-        weight_decay=args.weight_decay,
     )
 
     total_steps = max(1, len(train_loader) * args.epochs)
