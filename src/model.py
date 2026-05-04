@@ -12,7 +12,7 @@ positional-embedding interpolation needed for training.
 from __future__ import annotations
 
 import math
-from collections import OrderedDict
+from collections import namedtuple
 from functools import partial
 
 import torch
@@ -24,6 +24,7 @@ from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import MultiScaleRoIAlign
 
 from binaryattn import Block, resize_pos_embed
+from utils import _assert_strides_are_log2_contiguous
 
 VARIANTS = {
     "tiny": dict(embed_dim=192, depth=12, num_heads=3),
@@ -31,12 +32,33 @@ VARIANTS = {
     "base": dict(embed_dim=768, depth=12, num_heads=12),
 }
 
+ShapeSpec = namedtuple("ShapeSpec", ["channels", "stride"])
+
+
+def _ln2d(num_channels: int) -> nn.Module:
+    """Channel-first LayerNorm for (B, C, H, W) feature maps (==GroupNorm with 1 group)."""
+    return nn.GroupNorm(1, num_channels)
+
+
+class LastLevelMaxPool(nn.Module):
+    """Detectron2-style top block: subsample one FPN level by stride-2 max-pool to add a coarser level."""
+
+    def __init__(self, in_feature: str = "p5"):
+        super().__init__()
+        self.num_levels = 1
+        self.in_feature = in_feature
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return [F.max_pool2d(x, kernel_size=1, stride=2, padding=0)]
+
 
 class BinaryViTBackbone(nn.Module):
     """ViT feature extractor with binary QK-attention.
 
-    Returns a ``[B, embed_dim, H/patch, W/patch]`` feature map.  ``out_channels``
-    is set so the module plugs directly into ``FasterRCNN``.
+    Returns ``{"last_feat": [B, embed_dim, H/patch, W/patch]}`` — a single-feature
+    dict so the module slots into either a ``SimpleFeaturePyramid`` (which keys by
+    ``in_feature``) or directly into ``FasterRCNN`` (which forwards dicts through
+    to the RPN/ROI pool).
     """
 
     def __init__(
@@ -98,6 +120,9 @@ class BinaryViTBackbone(nn.Module):
             nn.init.zeros_(m.bias)
             nn.init.ones_(m.weight)
 
+    def output_shape(self) -> dict[str, ShapeSpec]:
+        return {"last_feat": ShapeSpec(channels=self.out_channels, stride=self.patch_size)}
+
     def _resized_pos_embed(self, h: int, w: int) -> torch.Tensor:
         gh, gw = self.grid_size
         if (h, w) == (gh, gw):
@@ -108,7 +133,7 @@ class BinaryViTBackbone(nn.Module):
         pe = pe.permute(0, 2, 3, 1).reshape(1, h * w, -1)
         return torch.cat([cls_pe, pe], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
         x = self.patch_embed(x)
@@ -117,73 +142,165 @@ class BinaryViTBackbone(nn.Module):
         x = self.blocks(x)
         x = self.norm(x)
         x = x[:, 1:].transpose(1, 2).reshape(B, -1, h, w)
-        return x
+        return {"last_feat": x}
 
 
 class SimpleFeaturePyramid(nn.Module):
-    """ViTDet-style simple feature pyramid (Li et al., 2022).
-
-    Builds a 4-level pyramid (strides 4, 8, 16, 32) from a single stride-16 ViT
-    feature map by per-level rescaling (transposed convs / pool) followed by a
-    1x1 + 3x3 conv tail.  GroupNorm chosen to be small-batch friendly.
+    """
+    This module implements SimpleFeaturePyramid in :paper:`vitdet`.
+    It creates pyramid features built on top of the input feature map.
     """
 
-    def __init__(self, in_channels: int, out_channels: int = 256):
-        super().__init__()
+    def __init__(
+        self,
+        net,
+        in_feature,
+        out_channels,
+        scale_factors,
+        top_block=None,
+        norm="LN",
+        square_pad=0,
+    ):
+        """
+        :param net (Backbone): module representing the subnetwork backbone.
+                Must be a subclass of :class:`Backbone`.
+        :param in_feature (str): names of the input feature maps coming
+                from the net.
+        :param out_channels (int): number of channels in the output feature maps.
+        :param scale_factors (list[float]): list of scaling factors to upsample or downsample
+                the input features for creating pyramid features.
+        :param top_block (nn.Module or None): if provided, an extra operation will
+                be performed on the output of the last (smallest resolution)
+                pyramid output, and the result will extend the result list. The top_block
+                further downsamples the feature map. It must have an attribute
+                "num_levels", meaning the number of extra pyramid levels added by
+                this block, and "in_feature", which is a string representing
+                its input feature (e.g., p5).
+        :param norm (str): the normalization to use.
+        :param square_pad (int): If > 0, require input images to be padded to specific square size.
+        """
+        super(SimpleFeaturePyramid, self).__init__()
+
+        self.scale_factors = scale_factors
+
+        input_shapes = net.output_shape()
+        strides = [
+            int(input_shapes[in_feature].stride / scale) for scale in scale_factors
+        ]
+        _assert_strides_are_log2_contiguous(strides)
+
+        dim = input_shapes[in_feature].channels
+        self.stages = []
+        use_bias = norm == ""
+        for idx, scale in enumerate(scale_factors):
+            out_dim = dim
+            if scale == 4.0:
+                layers = [
+                    nn.ConvTranspose2d(dim, dim // 2, kernel_size=2, stride=2),
+                    _ln2d(dim // 2),
+                    nn.GELU(),
+                    nn.ConvTranspose2d(dim // 2, dim // 4, kernel_size=2, stride=2),
+                ]
+                out_dim = dim // 4
+            elif scale == 2.0:
+                layers = [nn.ConvTranspose2d(dim, dim // 2, kernel_size=2, stride=2)]
+                out_dim = dim // 2
+            elif scale == 1.0:
+                layers = []
+            elif scale == 0.5:
+                layers = [nn.MaxPool2d(kernel_size=2, stride=2)]
+            else:
+                raise NotImplementedError(f"scale_factor={scale} is not supported yet.")
+
+            layers.extend(
+                [
+                    nn.Conv2d(out_dim, out_channels, kernel_size=1, bias=use_bias),
+                    _ln2d(out_channels),
+                    nn.Conv2d(
+                        out_channels, out_channels, kernel_size=3, padding=1, bias=use_bias
+                    ),
+                    _ln2d(out_channels),
+                ]
+            )
+            layers = nn.Sequential(*layers)
+
+            stage = int(math.log2(strides[idx]))
+            self.add_module(f"simfp_{stage}", layers)
+            self.stages.append(layers)
+
+        self.net = net
+        self.in_feature = in_feature
+        self.top_block = top_block
+        # Return feature names are "p<stage>", like ["p2", "p3", ..., "p6"]
+        self._out_feature_strides = {
+            "p{}".format(int(math.log2(s))): s for s in strides
+        }
+        # top block output feature maps.
+        if self.top_block is not None:
+            for s in range(stage, stage + self.top_block.num_levels):
+                self._out_feature_strides["p{}".format(s + 1)] = 2 ** (s + 1)
+
+        self._out_features = list(self._out_feature_strides.keys())
+        self._out_feature_channels = {k: out_channels for k in self._out_features}
+        self._size_divisibility = strides[-1]
+        self._square_pad = square_pad
         self.out_channels = out_channels
 
-        def gn(c: int) -> nn.Module:
-            return nn.GroupNorm(32, c)
+    @property
+    def padding_constraints(self):
+        return {
+            "size_divisiblity": self._size_divisibility,
+            "square_size": self._square_pad,
+        }
 
-        self.scale_ops = nn.ModuleList(
-            [
-                # stride 4: 4x upsample
-                nn.Sequential(
-                    nn.ConvTranspose2d(in_channels, in_channels, 2, 2),
-                    gn(in_channels),
-                    nn.GELU(),
-                    nn.ConvTranspose2d(in_channels, in_channels, 2, 2),
-                ),
-                # stride 8: 2x upsample
-                nn.ConvTranspose2d(in_channels, in_channels, 2, 2),
-                # stride 16: identity
-                nn.Identity(),
-                # stride 32: 2x downsample
-                nn.MaxPool2d(2, 2),
-            ]
-        )
-        self.tails = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, 1, bias=False),
-                    gn(out_channels),
-                    nn.GELU(),
-                    nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-                    gn(out_channels),
-                    nn.GELU(),
-                )
-                for _ in range(4)
-            ]
-        )
+    def forward(self, x):
+        """
+        :param x: Tensor of shape (N,C,H,W). H, W must be a multiple of ``self.size_divisibility``.
+        Returns:
+            dict[str->Tensor]:
+                mapping from feature map name to pyramid feature map tensor
+                in high to low resolution order. Returned feature names follow the FPN
+                convention: "p<stage>", where stage has stride = 2 ** stage e.g.,
+                ["p2", "p3", ..., "p6"].
+        """
+        bottom_up_features = self.net(x)
+        features = bottom_up_features[self.in_feature]
+        results = []
 
-    def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
-        out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
-        for i, (op, tail) in enumerate(zip(self.scale_ops, self.tails)):
-            out[str(i)] = tail(op(x))
-        return out
+        for stage in self.stages:
+            results.append(stage(features))
+
+        if self.top_block is not None:
+            if self.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[self.top_block.in_feature]
+            else:
+                top_block_in_feature = results[
+                    self._out_features.index(self.top_block.in_feature)
+                ]
+            results.extend(self.top_block(top_block_in_feature))
+        assert len(self._out_features) == len(results)
+        return {f: res for f, res in zip(self._out_features, results)}
 
 
-class BinaryViTBackboneWithFPN(nn.Module):
-    """``BinaryViTBackbone`` + ``SimpleFeaturePyramid`` for FasterRCNN with FPN."""
+# class BinaryViTBackboneWithFPN(nn.Module):
+#     """``BinaryViTBackbone`` + ``SimpleFeaturePyramid`` for FasterRCNN with FPN."""
 
-    def __init__(self, body: BinaryViTBackbone, fpn_out_channels: int = 256):
-        super().__init__()
-        self.body = body
-        self.fpn = SimpleFeaturePyramid(body.out_channels, fpn_out_channels)
-        self.out_channels = fpn_out_channels
+#     def __init__(self, body: BinaryViTBackbone, fpn_out_channels: int = 256):
+#         super().__init__()
+#         self.body = body
+#         self.fpn = SimpleFeaturePyramid(
+#             body,
+#             in_feature="last_feat",
+#             out_channels=256,
+#             scale_factors=(4.0, 2.0, 1.0, 0.5),
+#             top_block=LastLevelMaxPool(),
+#             norm="LN",
+#             square_pad=512,
+#         )
+#         self.out_channels = fpn_out_channels
 
-    def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
-        return self.fpn(self.body(x))
+#     def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
+#         return self.fpn(self.body(x))
 
 
 def load_pretrained_backbone(
@@ -199,8 +316,8 @@ def load_pretrained_backbone(
 
     Returns ``(missing_keys, unexpected_keys)`` from ``load_state_dict``.
     """
-    if hasattr(backbone, "body") and isinstance(backbone.body, BinaryViTBackbone):
-        backbone = backbone.body
+    if hasattr(backbone, "net") and isinstance(backbone.net, BinaryViTBackbone):
+        backbone = backbone.net
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt.get("model", ckpt.get("state_dict", ckpt))
@@ -266,13 +383,21 @@ def build_faster_rcnn(
         return tuple(max(1, round(s * anchor_scale)) for s in sizes)
 
     if use_fpn:
-        backbone = BinaryViTBackboneWithFPN(body, fpn_out_channels=fpn_out_channels)
+        backbone = SimpleFeaturePyramid(
+            body,
+            in_feature="last_feat",
+            out_channels=fpn_out_channels,
+            scale_factors=(4.0, 2.0, 1.0, 0.5),
+            top_block=LastLevelMaxPool(in_feature="p5"),
+            norm="LN",
+            square_pad=img_size,
+        )
         anchor_generator = AnchorGenerator(
-            sizes=tuple((s,) for s in _scale((32, 64, 128, 256))),
-            aspect_ratios=((0.5, 1.0, 2.0),) * 4,
+            sizes=tuple((s,) for s in _scale((32, 64, 128, 256, 512))),
+            aspect_ratios=((0.5, 1.0, 2.0),) * 5,
         )
         roi_pool = MultiScaleRoIAlign(
-            featmap_names=["0", "1", "2", "3"], output_size=7, sampling_ratio=2
+            featmap_names=["p2", "p3", "p4", "p5"], output_size=7, sampling_ratio=2
         )
     else:
         backbone = body
@@ -281,7 +406,7 @@ def build_faster_rcnn(
             aspect_ratios=((0.5, 1.0, 2.0),),
         )
         roi_pool = MultiScaleRoIAlign(
-            featmap_names=["0"], output_size=7, sampling_ratio=2
+            featmap_names=["last_feat"], output_size=7, sampling_ratio=2
         )
 
     return FasterRCNN(
