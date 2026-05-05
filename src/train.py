@@ -2,7 +2,7 @@
 
 Optimization recipe follows the BinaryAttention paper's detection setup:
 AdamW (betas 0.9/0.999, weight decay 0.1), base LR 1e-3, 250-iter linear warm-up,
-linear decay to zero across the remaining iterations.
+cosine decay to zero across the remaining iterations.
 """
 
 from __future__ import annotations
@@ -49,11 +49,13 @@ def collate_fn(batch):
 
 
 def make_scheduler(optimizer, total_steps: int, warmup_steps: int):
+    import math
+
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.0, 1.0 - progress)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -75,6 +77,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--warmup-iters", type=int, default=250)
+    p.add_argument(
+        "--backbone-lr-scale",
+        type=float,
+        default=0.1,
+        help="backbone LR = lr * backbone_lr_scale (use 1.0 when training from scratch)",
+    )
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--drop-path", type=float, default=0.1)
     p.add_argument(
@@ -177,18 +185,23 @@ def main() -> None:
             f"  unexpected ({len(unexpected)}): {unexpected[:6]}{' ...' if len(unexpected) > 6 else ''}"
         )
 
-    decay, no_decay = [], []
+    bb_decay, bb_no_decay, head_decay, head_no_decay = [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or "pos_embed" in name or "cls_token" in name:
-            no_decay.append(param)
+        is_backbone = name.startswith("backbone.")
+        no_wd = param.ndim <= 1 or "pos_embed" in name or "cls_token" in name
+        if is_backbone:
+            (bb_no_decay if no_wd else bb_decay).append(param)
         else:
-            decay.append(param)
+            (head_no_decay if no_wd else head_decay).append(param)
+    backbone_lr = args.lr * args.backbone_lr_scale
     optimizer = torch.optim.AdamW(
         [
-            {"params": decay, "weight_decay": args.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
+            {"params": bb_decay, "lr": backbone_lr, "weight_decay": args.weight_decay},
+            {"params": bb_no_decay, "lr": backbone_lr, "weight_decay": 0.0},
+            {"params": head_decay, "weight_decay": args.weight_decay},
+            {"params": head_no_decay, "weight_decay": 0.0},
         ],
         lr=args.lr,
         betas=(0.9, 0.999),

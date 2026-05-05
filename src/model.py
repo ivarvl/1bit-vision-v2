@@ -121,7 +121,9 @@ class BinaryViTBackbone(nn.Module):
             nn.init.ones_(m.weight)
 
     def output_shape(self) -> dict[str, ShapeSpec]:
-        return {"last_feat": ShapeSpec(channels=self.out_channels, stride=self.patch_size)}
+        return {
+            "last_feat": ShapeSpec(channels=self.out_channels, stride=self.patch_size)
+        }
 
     def _resized_pos_embed(self, h: int, w: int) -> torch.Tensor:
         gh, gw = self.grid_size
@@ -217,7 +219,11 @@ class SimpleFeaturePyramid(nn.Module):
                     nn.Conv2d(out_dim, out_channels, kernel_size=1, bias=use_bias),
                     _ln2d(out_channels),
                     nn.Conv2d(
-                        out_channels, out_channels, kernel_size=3, padding=1, bias=use_bias
+                        out_channels,
+                        out_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=use_bias,
                     ),
                     _ln2d(out_channels),
                 ]
@@ -280,27 +286,6 @@ class SimpleFeaturePyramid(nn.Module):
             results.extend(self.top_block(top_block_in_feature))
         assert len(self._out_features) == len(results)
         return {f: res for f, res in zip(self._out_features, results)}
-
-
-# class BinaryViTBackboneWithFPN(nn.Module):
-#     """``BinaryViTBackbone`` + ``SimpleFeaturePyramid`` for FasterRCNN with FPN."""
-
-#     def __init__(self, body: BinaryViTBackbone, fpn_out_channels: int = 256):
-#         super().__init__()
-#         self.body = body
-#         self.fpn = SimpleFeaturePyramid(
-#             body,
-#             in_feature="last_feat",
-#             out_channels=256,
-#             scale_factors=(4.0, 2.0, 1.0, 0.5),
-#             top_block=LastLevelMaxPool(),
-#             norm="LN",
-#             square_pad=512,
-#         )
-#         self.out_channels = fpn_out_channels
-
-#     def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
-#         return self.fpn(self.body(x))
 
 
 def load_pretrained_backbone(
